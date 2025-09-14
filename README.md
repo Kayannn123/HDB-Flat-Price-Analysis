@@ -1,2 +1,2 @@
-# HDB-Flat-Price-Analysis
-ST4248 Term Project
+# HDB-Resale-Flat-Price
+ST4248 Semester Project

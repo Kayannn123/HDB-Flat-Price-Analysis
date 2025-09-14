@@ -1,0 +1,153 @@
+---
+title: "Tree Models"
+author: "Jiaxin Zheng A0266129Y"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(stringr)
+library(ggpubr)
+library(corrplot)
+library(car)
+library(MASS)
+library(splines)
+library(boot)
+library(mgcv)
+library(tree)
+library(randomForest)
+library(ranger)
+library(gbm)
+library(xgboost)
+set.seed(4248)
+```
+
+```{r}
+df_clean <- read.csv("../data/df_clean.csv")
+head(df_clean)
+df_clean <- df_clean[, 2:11]
+df_clean %>%
+  mutate(month = ymd(month), town = as.factor(town), flat_type = as.factor(flat_type),
+         flat_model_group = as.factor(flat_model_group), region = as.factor(region)) -> df_clean
+df_tree <- df_clean[, !(names(df_clean) %in% c("lease_commence_date", "town"))]
+df_tree %>%
+  mutate(month = as.numeric(month)) -> df_tree
+head(df_tree)
+```
+```{r}
+trainidx <- sample(nrow(df_tree), 0.8*nrow(df_tree))
+train = df_tree[trainidx,]
+test = df_tree[-trainidx,]
+```
+
+### Regression trees
+```{r}
+tree.regression <- tree(resale_price ~ ., data = train)
+summary(tree.regression)
+plot(tree.regression, cex = 0.7)
+text(tree.regression, pretty = 0, cex = 0.7)
+```
+```{r}
+yhat_tree <- predict(tree.regression, newdata = test)
+rmse_tree <- sqrt(mean((yhat_tree - test$resale_price)^2))
+cat("Test RMSE for Regression Tree:", rmse_tree, "\n")
+```
+### Tree Pruning
+```{r}
+cv.regression <- cv.tree(tree.regression)
+plot(cv.regression$size, cv.regression$dev, type = "b", xlab = "Tree Size", ylab = "CV Deviance")
+```
+```{r}
+pruned.hdb <- prune.tree(tree.regression, best = 14)
+plot(pruned.hdb)
+text(pruned.hdb, pretty = 0)
+
+yhat_pruned <- predict(pruned.hdb, newdata = test)
+rmse_pruned <- sqrt(mean((yhat_pruned - test$resale_price)^2))
+cat("Test RMSE for Pruned Tree (size=11):", rmse_pruned, "\n")
+```
+We initially conducted cost-complexity pruning to improve the generalization performance of the regression tree. However, since our dataset contains only 7 predictors and over 180,000 observations, the full tree is already well-regularized and not overly complex. As shown in the cross-validation plot, while the CV deviance decreases with pruning, the test RMSE does not improve. Hence, we choose to retain the full tree for comparison purposes.
+
+### Boosting
+```{r}
+boost.tree = gbm(resale_price ~ ., data = train, distribution = "gaussian", n.trees = 5000, interaction.depth = 4)
+summary(boost.tree)
+print(min_cv)
+summary(boost.tree, n.trees = best.iter)
+plot(boost.tree, i="floor_area_sqm")
+plot(boost.tree, i="region")
+```
+```{r}
+yhat.boost = predict(boost.tree, newdata = test, n.trees = 5000)
+rmse.boost = sqrt(mean((yhat.boost - test$resale_price)^2))
+cat("Test RMSE for Boosting:", rmse.boost)
+```
+```{r}
+X_train <- model.matrix(resale_price ~ . -1, data = train)
+y_train <- train$resale_price
+X_test <- model.matrix(resale_price ~ . -1, data = test)
+y_test <- test$resale_price 
+
+train_idx = sample(nrow(train), 0.8*nrow(train))
+dtrain <- xgb.DMatrix(data = X_train[train_idx, ], label = y_train[train_idx])
+dvalid <- xgb.DMatrix(data = X_train[-train_idx, ], label = y_train[-train_idx])
+dtest <- xgb.DMatrix(data = X_test)
+watchlist <- list(train = dtrain, eval = dvalid)
+xgb_model <- xgb.train(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 5000,
+  max_depth = 6,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  early_stopping_rounds = 50,
+  watchlist = watchlist,
+  print_every_n = 50,
+  verbose = 1
+)
+best_iter <- xgb_model$best_iteration
+pred.xgb <- predict(xgb_model, newdata = dtest, ntreelimit = best_iter)
+rmse.xgb <- sqrt(mean((y_test - pred.xgb)^2))
+
+cat("XGBoost RMSE:", rmse.xgb, "\n")
+
+
+```
+```{r}
+get_adjusted_r2 <- function(y_true, y_pred, p) {
+  n <- length(y_true)
+  rss <- sum((y_true - y_pred)^2)
+  tss <- sum((y_true - mean(y_true))^2)
+  r2 <- 1 - rss / tss
+  adj_r2 <- 1 - (1 - r2) * ((n - 1) / (n - p - 1))
+  return(round(adj_r2, 4))
+}
+y_true = test$resale_price
+
+adj_r2_tree <- get_adjusted_r2(y_true, yhat_pruned, 7)
+adj_r2_boost <- get_adjusted_r2(y_true, yhat.boost, 7)
+adj_r2_xgb <- get_adjusted_r2(y_true, pred.xgb, 7)
+
+new_results <- data.frame(
+  Model = c("Regression Tree", "Boosting", "XGBoost"),
+  RMSE = c(rmse_tree, rmse.boost, rmse.xgb),
+  Adjusted_R2 = c(adj_r2_tree, adj_r2_boost, adj_r2_xgb)
+)
+
+result <- data.frame(
+  Model = c("Linear", "Natural Spline", "GAM"),
+  RMSE = c(74664.21, 74238.72, 74228.91),
+  Adjusted_R2 = c(0.8369, 0.8382, 0.8383)
+)
+
+final_result <- rbind(result, new_results)
+final_result 
+```

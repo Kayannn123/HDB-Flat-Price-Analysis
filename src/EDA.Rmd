@@ -1,0 +1,252 @@
+---
+title: "Exploratory Data Analysis"
+author: "Jiaxin Zheng A0266129Y"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(stringr)
+library(ggpubr)
+library(corrplot)
+```
+
+## Import Dataset
+```{r}
+df <- read.csv("../data/HDBPrice_cleaned.csv")
+head(df)
+# View structure
+str(df)
+summary(df)
+```
+### Data type conversion
+```{r}
+# Convert 'month' to Date type
+df <- df %>% mutate(month = ymd(month))
+
+# Check categories
+cat("flat_type category:", unique(df$flat_type), "\n")
+cat("flat_model category:", unique(df$flat_model), "\n")
+cat("town category:", unique(df$town), "\n")
+
+# Convert to factors
+df <- df %>%
+  mutate(across(c(flat_type, flat_model, town), as.factor))
+
+head(df)
+```
+```{r}
+unique(df$storey_range) 
+print(length(unique(df$storey_range) ))
+```
+There are total of 17 unique values of storey_range. Storey_range could have some effect over price usually. Therefore, we tried to reserve this columns. However, to allow the model to take numerical meaning, we use the median. Besides, while location does matter to resale_price, details such as block and street would be too complex to be included. Therefore, we will drop it. Furthermore, we build remaining_lease_years that take numerical form of remaining_lease, so we can simply drop it.
+```{r}
+df_clean <- df %>%
+  mutate(
+    storey_median = as.numeric(str_extract(storey_range, "\\d+")),
+    lease_commence_date = as.numeric(lease_commence_date)
+  ) 
+```
+
+```{r}
+df_clean %>%
+  select(-block, -storey_range, -transaction_year, -street_name,- remaining_lease, -flat_model) -> df_clean
+```
+
+## Exploratory Data Analysis
+
+```{r}
+ggplot(df_clean, aes(x = resale_price)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Resale Price",
+       x = "Resale Price", y = "Count")
+
+```
+Here, the distribution of Resale Price is slightly right skewed, but we not identify obvious outliers that may influence the performance of predictive models. 
+
+```{r}
+p1 <- ggplot(df_clean, aes(x = lease_commence_date)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +
+  labs(title = "Distribution of Lease Commencement Year",
+       x = "Lease Commencement Year", y = "Count")
+
+p2 <- ggplot(df_clean, aes(x = remaining_lease_years)) +
+  geom_histogram(binwidth = 1, fill = "indianred", color = "black") +
+  labs(title = "Distribution of Remaining Lease (years)",
+       x = "Remaining Lease (years)", y = "Count")
+
+ggarrange(p1, p2, ncol = 1, nrow = 2)
+
+```
+```{r}
+highlight_point <- df_clean %>%
+  filter(floor_area_sqm > 300 & resale_price > 1500000)
+
+ggplot(df_clean, aes(x = floor_area_sqm, y = resale_price)) +
+  geom_point(alpha = 0.1, color = "black") +
+  geom_point(data = highlight_point, aes(x = floor_area_sqm, y = resale_price),
+             color = "red", size = 3) +
+  geom_text(data = highlight_point, aes(label = paste0("(", floor_area_sqm, " sqm, $", resale_price/1000, "k)")),
+            hjust = 1, vjust = -0.5, size = 3, color = "red") +
+  labs(title = "Resale Price vs Floor Area",
+       subtitle = "Red dot: Unusually large & expensive flat",
+       x = "Floor Area (sqm)", y = "Resale Price") +
+  theme_minimal()
+```
+We observe a strong positive relationship between resale price and floor area, with some heteroskedasticity. A single outlier with floor area exceeding 300 sqm and resale price above $1.5M was identified and highlighted. This observation may represent an Executive Maisonette or rare DBSS unit and is excluded from robust regression models in later analysis.
+
+```{r}
+df_clean %>%
+  group_by(month) %>%
+  summarise(mean_price = mean(resale_price)) %>%
+  ggplot(aes(x = month, y = mean_price)) +
+  geom_line(color = "blue") +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dashed", color = "red") +
+  annotate("text", x = as.Date("2020-01-01"), y = 550000,
+           label = "COVID-19", angle = 90, vjust = -0.5, hjust = 1.1, color = "red", size = 3) +
+  labs(title = "Average Resale Price Over Time",
+       x = "Month", y = "Average Resale Price") +
+  theme_minimal()
+
+```
+
+```{r}
+ggplot(df_clean, aes(x = flat_type, y = resale_price)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Resale Price by Flat Type",
+       x = "Flat Type", y = "Resale Price") +
+  theme_minimal()
+
+```
+```{r}
+df_numeric <- df_clean %>%
+  select(where(is.numeric)) 
+
+cor_matrix <- cor(df_numeric)
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.7)
+```
+Given that remaining_lease_years and lease_commence_date are indeed indicating the same thing, we need to drop one column to avoid collinearity in the regression model.(remaining_lease_years to be conserved)
+
+To further investigate the growth of resale price
+```{r}
+df_clean %>%
+  mutate(year = as.numeric(format(month, "%Y"))) %>%
+  group_by(year) %>%
+  summarise(mean_price = mean(resale_price)) %>%
+  mutate(growth_rate = (mean_price - lag(mean_price)) / lag(mean_price)) -> annual_trend
+
+annual_trend %>%
+  filter(!is.na(growth_rate)) %>%
+  mutate(growth_rate_pct = growth_rate * 100) %>%
+  ggplot(aes(x = factor(year), y = growth_rate_pct)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = paste0(round(growth_rate_pct, 1), "%")), vjust = -0.5) +
+  labs(title = "Annual HDB Resale Price Growth Rate",
+       x = "Year", y = "Growth Rate (%)") +
+  theme_minimal()
+
+
+```
+```{r}
+df_clean %>%
+  mutate(month = as.Date(month)) %>%
+  arrange(month) -> df_clean
+
+latest_month <- max(df_clean$month)
+start_month <- latest_month %m-% months(12)
+
+df_clean %>%
+  filter(month >= start_month) -> df_recent
+
+df_recent %>%
+  group_by(month) %>%
+  summarise(avg_price = mean(resale_price)) %>%
+  arrange(month) %>%
+  mutate(growth_rate = (avg_price - lag(avg_price)) / lag(avg_price),
+         trend = case_when(
+           growth_rate > 0 ~ "Up",
+           growth_rate < 0 ~ "Down",
+           growth_rate == 0 ~ "Unchanged"
+         ))  %>%
+  ungroup() %>%
+  filter(!is.na(trend)) -> monthly_avg
+
+monthly_avg_plot <- monthly_avg %>%
+  filter(!is.na(trend)) %>%
+  mutate(month_label = format(month, "%Y-%m")) 
+
+ggplot(monthly_avg_plot, aes(x = month_label, y = growth_rate * 100, fill = trend)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(growth_rate * 100, 1), "%")), vjust = ifelse(monthly_avg_plot$growth_rate >= 0, -0.5, 1.2)) +
+  scale_fill_manual(values = c("Down" = "red", "Up" = "darkgreen")) +
+  labs(title = "HDB Resale Price Growth Rate (Past 12 Months)",
+       x = "Month", y = "Growth Rate (%)", fill = "Trend") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+df_clean %>%
+  mutate(month = as.Date(month)) %>%
+  arrange(month) -> df_clean
+
+latest_month <- max(df_clean$month)
+start_month <- latest_month %m-% months(18)
+
+df_clean %>%
+  filter(month >= start_month) -> df_recent
+df_recent <- df_recent %>%
+  mutate(quarter = paste0(year(month), "-Q", quarter(month)))
+
+quarterly_avg <- df_recent %>%
+  group_by(region, quarter) %>%
+  summarise(avg_price = mean(resale_price), .groups = "drop") %>%
+  arrange(region, quarter) %>%
+  group_by(region) %>%
+  mutate(growth_rate = (avg_price - lag(avg_price)) / lag(avg_price),
+         trend = case_when(
+           growth_rate > 0 ~ "Up",
+           growth_rate < 0 ~ "Down",
+           growth_rate == 0 ~ "Unchanged"
+         )) %>%
+  ungroup()
+
+quarterly_avg %>%
+  filter(!is.na(trend)) %>%
+  ggplot(aes(x = quarter, y = growth_rate * 100, fill = trend)) +
+  geom_col() +
+  scale_fill_manual(values = c("Down" = "red", "Up" = "darkgreen")) +
+  facet_wrap(~ region, ncol = 3) +
+  labs(title = "Quarterly HDB Resale Price Growth Rate by Region",
+       x = "Quarter", y = "Growth Rate (%)", fill = "Trend") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+df_recent <- df_recent %>%
+  left_join(quarterly_avg, 
+            by = c("region", "quarter")) %>%
+  filter(!is.na(trend)) %>%
+  mutate(trend = factor(trend, levels = c("Down", "Up"))) %>%
+  mutate(region = factor(region), flat_model_group = factor(flat_model_group))
+
+head(df_recent)
+logit_model <- glm(trend ~ floor_area_sqm + remaining_lease_years + flat_type + storey_median + region + flat_model_group,data = df_recent, family = "binomial")
+
+summary(logit_model)
+exp(coef(logit_model))
+```
+
+

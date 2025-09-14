@@ -1,0 +1,398 @@
+---
+title: "Q3"
+author: "Jiaxin Zheng A0266129Y"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We have built linear regression models, natural spline, gam with smoothing spline, regression tree, and boosting tree. Now, we try to estimate which type of flat we predict the price most correctly. But before that, we should see the distribution of price across various flat type. Besides, we shall also see the sample size.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(stringr)
+library(ggpubr)
+library(corrplot)
+library(car)
+library(MASS)
+library(splines)
+library(boot)
+library(mgcv)
+library(tree)
+library(randomForest)
+library(ranger)
+library(gbm)
+library(xgboost)
+set.seed(4248)
+```
+```{r}
+ggplot(df, aes(x = flat_type, y = resale_price)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Resale Price Distribution by Flat Type",
+       x = "Flat Type",
+       y = "Resale Price (SGD)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+flat_type_counts <- df %>%
+  group_by(flat_type) %>%
+  summarise(count = n())
+
+ggplot(flat_type_counts, aes(x = flat_type, y = count)) +
+  geom_col(fill = "tomato") +
+  labs(title = "Sample Size by Flat Type",
+       x = "Flat Type",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+```{r}
+flat_type_counts <- test %>%
+  group_by(flat_type) %>%
+  summarise(count = n())
+
+ggplot(flat_type_counts, aes(x = flat_type, y = count)) +
+  geom_col(fill = "tomato") +
+  labs(title = "Sample Size by Flat Type",
+       x = "Flat Type",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Figure 1 shows that resale prices generally increase with flat size, from 1-room to multi-generation flats. The spread also widens significantly for larger flats (e.g., 5-room, Executive), suggesting higher price variability and potential influence of more diverse features such as location or renovations.
+
+Figure 2 highlights the imbalance in sample sizes. 4-room, 5-room, and 3-room flats dominate the dataset, while 1-room and multi-generation flats have very few observations. This disparity can affect model training and prediction accuracy — for instance, models might underperform on rarely seen flat types due to lack of sufficient learning data.
+
+Therefore, to allow our model to be able to have as accurate prediction, the prediction will focus only on 3-room, 4-room, and 5-room to avoid possible bias.
+
+## Model building
+According to previous analysis, we build six different models to evaluate the output.
+
+### Training and Test Data Split
+#### Linear Data
+```{r}
+results <- data.frame()
+train_linear <- df_linear[trainidx,]
+train_linear <- train_linear[ , -2]
+test_linear <- df_linear[-trainidx,]
+head(train_linear)
+test_linear %>%
+  filter(flat_type == "3 ROOM") -> test_sub1
+test_linear %>%
+  filter(flat_type == "4 ROOM") -> test_sub2
+test_linear %>%
+  filter(flat_type == "5 ROOM") -> test_sub3
+
+test_sub1 <- test_sub1[, -2]
+test_sub2 <- test_sub2[, -2]
+test_sub3 <- test_sub3[, -2]
+
+
+```
+
+### 1. Simple Linear Regression
+```{r}
+null_model <- lm(log(resale_price) ~ 1, data = train_linear)
+full_model <- lm(log(resale_price) ~ ., data = train_linear)
+
+# forward stepwise selection based on AIC
+forward_model <- stepAIC(null_model,
+                         scope = list(lower = null_model, upper = full_model),
+                         direction = "forward",
+                         trace = TRUE)
+
+```
+
+```{r}
+interaction_terms <- c(
+  "floor_area_sqm:remaining_lease_years",
+  "storey_median:region",
+  "floor_area_sqm:region",
+  "month:region",
+  "flat_model_group:storey_median"
+)
+
+interaction_results <- data.frame()
+
+for (term in interaction_terms) {
+  formula_new <- as.formula(paste("log(resale_price) ~", 
+                                  paste(all.vars(formula(forward_model))[-1], collapse = " +"), 
+                                  "+", term))
+  
+  model_new <- lm(formula_new, data = train_linear)
+  
+  model_summary <- summary(model_new)
+  model_aic <- AIC(model_new)
+  r2 <- model_summary$r.squared
+  adj_r2 <- model_summary$adj.r.squared
+  rss <- sum(model_summary$residuals^2)
+  
+  interaction_results <- rbind(interaction_results, data.frame(
+    interaction = term,
+    AIC = model_aic,
+    R2 = r2,
+    Adjusted_R2 = adj_r2,
+    RSS = rss
+  ))
+}
+
+print(interaction_results[order(interaction_results$AIC), ])
+
+```
+```{r}
+lm.fit <- lm(log(resale_price) ~ floor_area_sqm*region + month + remaining_lease_years + 
+    storey_median + flat_model_group, data = train_linear)
+adj_r2_lm <- summary(lm.fit)$adj.r.squared
+
+y <- test_sub1$resale_price
+pred <- predict(lm.fit, newdata = test_sub1)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "lm.fit", Test_MSE = rmse, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub2$resale_price
+pred <- predict(lm.fit, newdata = test_sub2)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "lm.fit", Test_MSE = rmse, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub3$resale_price
+pred <- predict(lm.fit, newdata = test_sub3)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "lm.fit", Test_MSE = rmse, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+We evaluated the performance of our final linear regression model, enhanced with a floor_area_sqm:region interaction term, across three common flat types. Results show that 3-Room flats are the most predictable, with the lowest RMSE, possibly due to their standardized layout and smaller price variance. In contrast, 5-Room flats showed the highest RMSE, likely reflecting higher price dispersion due to larger space, renovation variation, and market sensitivity.
+
+### Natural Cubic Spline
+```{r}
+get_cv_error <- function(df_val) {
+  model <- glm(log(resale_price) ~ ns(floor_area_sqm, df = df_val) +
+                 remaining_lease_years + flat_model_group +
+                 region + storey_median + month,
+               data = train_linear)
+  cv_result <- cv.glm(train, model, K = 10)
+  return(cv_result$delta[1])
+}
+
+df_list <- 4:15
+cv_errors <- sapply(df_list, get_cv_error)
+
+plot(df_list, cv_errors, type = "b", pch = 19,
+     xlab = "Degrees of Freedom for ns(floor_area_sqm)",
+     ylab = "10-fold CV Error",
+     main = "CV Error vs Spline Degrees of Freedom")
+
+```
+```{r}
+ns.fit<- lm(log(resale_price) ~ ns(floor_area_sqm, df = 10) +
+                 remaining_lease_years + flat_model_group +
+                 region + storey_median + month,
+               data = train_linear)
+adj_r2_ns <- summary(ns.fit)$r.sq
+y <- test_sub1$resale_price
+pred <- predict(ns.fit, newdata = test_sub1)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "ns.fit", Test_MSE = rmse, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub2$resale_price
+pred <- predict(ns.fit, newdata = test_sub2)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "ns.fit", Test_MSE = rmse, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub3$resale_price
+pred <- predict(ns.fit, newdata = test_sub3)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "ns.fit", Test_MSE = rmse, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+### Smoothing Spline
+```{r}
+model_gam <- gam(log(resale_price) ~ s(floor_area_sqm) +
+                   remaining_lease_years + flat_model_group +
+                   region + storey_median + month,
+                 data = train_linear)
+
+adj_r2_gam <- summary(model_gam)$r.sq
+y <- test_sub1$resale_price
+pred <- predict(model_gam, newdata = test_sub1)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "gam.fit", Test_MSE = rmse, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub2$resale_price
+pred <- predict(model_gam, newdata = test_sub2)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "gam.fit", Test_MSE = rmse, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub3$resale_price
+pred <- predict(model_gam, newdata = test_sub3)
+rmse <- sqrt(mean((y-exp(pred))^2))
+result <- data.frame(Model = "gam.fit", Test_MSE = rmse, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+```{r}
+evals <- data.frame()
+evals <- rbind(evals, data.frame(Model = "lm", Adjusted_R2 = adj_r2_lm))
+evals <- rbind(evals, data.frame(Model = "ns", Adjusted_R2 = adj_r2_ns))
+evals <- rbind(evals, data.frame(Model = "gam", Adjusted_R2 = adj_r2_gam))
+
+evals
+```
+#### Tree Data
+```{r}
+train_tree <- df_tree[trainidx,]
+test_tree <- df_tree[-trainidx,]
+train_tree <- train_tree[, -2]
+head(train_tree)
+
+test_tree %>%
+  filter(flat_type == "3 ROOM") -> test_sub1
+test_tree %>%
+  filter(flat_type == "4 ROOM") -> test_sub2
+test_tree %>%
+  filter(flat_type == "5 ROOM") -> test_sub3
+
+test_sub1 <- test_sub1[, -2]
+test_sub2 <- test_sub2[, -2]
+test_sub3 <- test_sub3[, -2]
+```
+### Regression tree
+```{r}
+tree.regression <- tree(resale_price ~ ., data = train_tree)
+summary(tree.regression)
+plot(tree.regression, cex = 0.7)
+text(tree.regression, pretty = 0, cex = 0.7)
+
+y <- test_sub1$resale_price
+pred <- predict(tree.regression, newdata = test_sub1)
+rmse <- sqrt(mean((y-pred)^2))
+result <- data.frame(Model = "regression_tree", Test_MSE = rmse, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub2$resale_price
+pred <- predict(tree.regression, newdata = test_sub2)
+rmse <- sqrt(mean((y-pred)^2))
+result <- data.frame(Model = "regression_tree", Test_MSE = rmse, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub3$resale_price
+pred <- predict(tree.regression, newdata = test_sub3)
+rmse <- sqrt(mean((y-pred)^2))
+result <- data.frame(Model = "regression_tree", Test_MSE = rmse, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+### Boosting
+```{r}
+boost.tree = gbm(resale_price ~ ., data = train_tree, distribution = "gaussian", n.trees = 5000, interaction.depth = 4)
+summary(boost.tree)
+plot(boost.tree, i="floor_area_sqm")
+plot(boost.tree, i="region")
+
+y <- test_sub1$resale_price
+pred.boost = predict(boost.tree, newdata = test_sub1, n.trees = 5000)
+rmse.boost = sqrt(mean((pred.boost - y)^2))
+result <- data.frame(Model = "Boosting", Test_MSE = rmse.boost, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub2$resale_price
+pred.boost = predict(boost.tree, newdata = test_sub2, n.trees = 5000)
+rmse.boost = sqrt(mean((pred.boost - y)^2))
+result <- data.frame(Model = "Boosting", Test_MSE = rmse.boost, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+y <- test_sub3$resale_price
+pred.boost = predict(boost.tree, newdata = test_sub3, n.trees = 5000)
+rmse.boost = sqrt(mean((pred.boost - y)^2))
+result <- data.frame(Model = "Boosting", Test_MSE = rmse.boost, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+
+
+```{r}
+train_idx = sample(nrow(train_tree), 0.8*nrow(train_tree))
+X_train <- model.matrix(resale_price ~ . -1, data = train_tree)
+y_train <- train_tree$resale_price
+dtrain <- xgb.DMatrix(data = X_train[train_idx, ], label = y_train[train_idx])
+dvalid <- xgb.DMatrix(data = X_train[-train_idx, ], label = y_train[-train_idx])
+
+watchlist <- list(train = dtrain, eval = dvalid)
+xgb_model <- xgb.train(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 5000,
+  max_depth = 6,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  early_stopping_rounds = 50,
+  watchlist = watchlist,
+  print_every_n = 50,
+  verbose = 1
+)
+best_iter <- xgb_model$best_iteration
+```
+```{r}
+X_test <- model.matrix(resale_price ~ . -1, data = test_sub1)
+y_test <- test_sub1$resale_price 
+dtest <- xgb.DMatrix(data = X_test)
+pred.xgb <- predict(xgb_model, newdata = dtest,  iteration_range = c(0, best_iter))
+rmse.xgb <- sqrt(mean((y_test - pred.xgb)^2))
+result <- data.frame(Model = "xgb.fit", Test_MSE = rmse.xgb, room_type ="3 ROOM")
+results <- rbind(results, result)
+
+X_test <- model.matrix(resale_price ~ . -1, data = test_sub2)
+y_test <- test_sub2$resale_price 
+dtest <- xgb.DMatrix(data = X_test)
+pred.xgb <- predict(xgb_model, newdata = dtest,  iteration_range = c(0, best_iter))
+rmse.xgb <- sqrt(mean((y_test - pred.xgb)^2))
+result <- data.frame(Model = "xgb.fit", Test_MSE = rmse.xgb, room_type ="4 ROOM")
+results <- rbind(results, result)
+
+X_test <- model.matrix(resale_price ~ . -1, data = test_sub3)
+y_test <- test_sub3$resale_price 
+dtest <- xgb.DMatrix(data = X_test)
+pred.xgb <- predict(xgb_model, newdata = dtest,  iteration_range = c(0, best_iter))
+rmse.xgb <- sqrt(mean((y_test - pred.xgb)^2))
+result <- data.frame(Model = "xgb.fit", Test_MSE = rmse.xgb, room_type ="5 ROOM")
+results <- rbind(results, result)
+
+results
+```
+
+```{r}
+results_wide <- results %>%
+  pivot_wider(
+    names_from = room_type,
+    values_from = Test_MSE
+  )
+
+results_wide
+```
+
+
+
